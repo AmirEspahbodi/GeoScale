@@ -1,0 +1,9 @@
+[submodule "services/order"]
+	path = services/order
+	url = https://github.com/AmirEspahbodi/geoscalse-order-service.git
+[submodule "services/ingestion"]
+	path = services/ingestion
+	url = https://github.com/AmirEspahbodi/geoscalse-ingestion-service.git
+[submodule "services/matching_engine"]
+	path = services/matching_engine
+	url = https://github.com/AmirEspahbodi/geoscalse-matching-engine.git
