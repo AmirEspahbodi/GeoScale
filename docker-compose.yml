@@ -1,0 +1,155 @@
+version: "3.8"
+
+# ==========================================
+# NETWORK SEGREGATION
+# ==========================================
+networks:
+  ingress-net: # Public facing (API Gateway -> Services)
+    driver: bridge
+  data-net: # Internal only (Services -> DB/Kafka/Redis)
+    driver: bridge
+    internal: true # No internet access for database layer
+
+services:
+  # ----------------------------------------------------------------
+  # INFRASTRUCTURE: DATA LAYER
+  # ----------------------------------------------------------------
+
+  # 1. Spatial Database (PostgreSQL + PostGIS)
+  postgres:
+    image: postgis/postgis:15-3.3
+    networks:
+      - data-net
+    environment:
+      POSTGRES_USER: ${DB_USER:-geoscale}
+      POSTGRES_PASSWORD: ${DB_PASS:-securepassword}
+      POSTGRES_DB: geoscale_orders
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U geoscale -d geoscale_orders"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+
+  # 2. Redis Stack (Cache + Geo Index + Locking)
+  redis:
+    image: redis/redis-stack-server:latest
+    networks:
+      - data-net
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # 3. Message Broker (Apache Kafka + Zookeeper)
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    networks:
+      - data-net
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    networks:
+      - data-net
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      # Listeners: INTERNAL for inter-container, EXTERNAL for host debug
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    healthcheck:
+      test: nc -z localhost 9092 || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ----------------------------------------------------------------
+  # APPLICATION MICROSERVICES
+  # ----------------------------------------------------------------
+
+  # 1. Ingestion Service (Public facing)
+  ingestion-service:
+    build:
+      context: ./services/ingestion-service
+      dockerfile: Dockerfile
+    networks:
+      - ingress-net
+      - data-net
+    ports:
+      - "8001:8000"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - REDIS_URL=redis://redis:6379/0
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 512M
+
+  # 2. Matching Engine (Public facing)
+  matching-engine:
+    build:
+      context: ./services/matching-engine
+      dockerfile: Dockerfile
+    networks:
+      - ingress-net
+      - data-net
+    ports:
+      - "8002:8000"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G # Needs more RAM for In-Memory Index
+
+  # 3. Order Service (Backend Logic)
+  order-service:
+    build:
+      context: ./services/order-service
+      dockerfile: Dockerfile
+    command: sh -c "python src/manage.py migrate && gunicorn src.config.wsgi:application --bind 0.0.0.0:8000"
+    networks:
+      - ingress-net
+      - data-net
+    ports:
+      - "8003:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgres://geoscale:securepassword@postgres:5432/geoscale_orders
+      - REDIS_URL=redis://redis:6379/1
+
+volumes:
+  postgres_data:
+  redis_data:
